@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Model files
+/models/
+models/*.pt
+models/*.gguf
+models/*.gguf.part
+models/tiny.pt
+models/large-v2.pt
+models/mistral-7b-instruct-v0.1.Q4_0.gguf.part
+
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# VS Code
+.vscode/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
