@@ -13,6 +13,10 @@ import hashlib
 import requests
 from tqdm import tqdm
 import google.generativeai as genai
+import uuid
+from datetime import datetime
+import re
+from transformers import AutoModelForCausalLM, AutoTokenizer  # New imports
 
 try:
     from dotenv import load_dotenv
@@ -205,6 +209,21 @@ def initialize_whisper_model():
             logger.info(f"Retrying... (attempt {attempt + 1}/{max_retries})")
             time.sleep(5)  # Add delay between retries
 
+# Initialize offline model
+def initialize_offline_model():
+    try:
+        model_name = "microsoft/phi-2"  # Using a smaller model that works well offline
+        logger.info(f"Loading offline model: {model_name}")
+        
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
+        
+        logger.info("Offline model initialized successfully")
+        return model, tokenizer
+    except Exception as e:
+        logger.error(f"Error initializing offline model: {str(e)}")
+        raise
+
 def init_gemini():
     """Initialize Gemini API"""
     try:
@@ -237,6 +256,7 @@ def generate_response(prompt):
 # Initialize models
 try:
     whisper_model = initialize_whisper_model()
+    offline_model, offline_tokenizer = initialize_offline_model()  # Initialize offline model
     model = init_gemini()
     logger.info("Models initialized successfully")
 except Exception as e:
@@ -282,9 +302,28 @@ except Exception as e:
     logger.error(f"Error initializing TTS engine: {str(e)}")
     raise
 
-def tts_speak_to_file(text, filename="audio_files/response.wav"):
+def clean_text(text):
+    """Clean text from special characters and normalize spacing"""
+    # Remove asterisks, quotes, and normalize newlines
+    cleaned = re.sub(r'[\*\"\'\n]+', ' ', text)
+    # Normalize spaces (remove multiple spaces)
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    # Strip leading/trailing whitespace
+    cleaned = cleaned.strip()
+    return cleaned
+
+def tts_speak_to_file(text, filename=None):
     try:
-        engine.save_to_file(text, filename)
+        # Clean the text before TTS processing
+        cleaned_text = clean_text(text)
+        
+        if filename is None:
+            # Generate unique filename with date and random ID
+            date_str = datetime.now().strftime("%Y%m%d")
+            unique_id = str(uuid.uuid4())[:8]
+            filename = f"audio_files/{date_str}_response_{unique_id}.wav"
+        
+        engine.save_to_file(cleaned_text, filename)
         engine.runAndWait()
         return filename
     except Exception as e:
@@ -418,6 +457,79 @@ async def textbot(question: str = Body(..., embed=True, description="Teks pertan
         raise he
     except Exception as e:
         logger.error(f"Error in textbot endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error occurred")
+
+@app.post("/textbot/offline",
+    response_model=dict,
+    summary="Send text message to bot using offline model",
+    description="""
+    Send a text question to the bot and receive a text response using the offline model.
+    This endpoint works completely offline without requiring internet connection.
+    """,
+    responses={
+        200: {
+            "description": "Successful response",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "question": "apa kabar",
+                        "answer": "baik terimakasih ada yang bisa saya bantu",
+                        "audio_url": "audio_files/response.wav"
+                    }
+                }
+            }
+        },
+        422: {"description": "Validation Error"},
+        500: {"description": "Internal Server Error"}
+    }
+)
+async def textbot_offline(question: str = Body(..., embed=True, description="Question text to send to the bot")):
+    try:
+        if not question or question.strip() == "":
+            raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+        # Check Knowledge Base first
+        response_text = None
+        for key in knowledge_base:
+            if key.lower() in question.lower():
+                response_text = knowledge_base[key]
+                break
+
+        # If no match in knowledge base, use offline model
+        if not response_text:
+            # Format the prompt for the model
+            prompt = f"Q: {question}\nA:"
+            
+            # Generate response using offline model
+            inputs = offline_tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
+            outputs = offline_model.generate(
+                **inputs,
+                max_length=512,
+                num_return_sequences=1,
+                temperature=0.7,
+                pad_token_id=offline_tokenizer.eos_token_id
+            )
+            response_text = offline_tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            # Clean up the response by removing the prompt and any extra whitespace
+            response_text = response_text.replace(prompt, "").strip()
+
+        # Generate audio response
+        try:
+            audio_output_path = tts_speak_to_file(response_text)
+        except Exception as e:
+            logger.error(f"TTS error: {str(e)}")
+            raise HTTPException(status_code=500, detail="Error generating audio response")
+
+        return {
+            "question": question,
+            "answer": response_text,
+            "audio_url": audio_output_path
+        }
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error in textbot_offline endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error occurred")
 
 @app.get("/audio/{filename}")
